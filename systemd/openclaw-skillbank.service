@@ -4,6 +4,9 @@ After=network.target
 
 [Service]
 Type=oneshot
+# Loads SKILLBANK_API_URL / SKILLBANK_API_KEY / SKILLBANK_API_FORMAT /
+# SKILLBANK_MODEL / SKILLBANK_BUSY_GUARD_URL extracted from openclaw.json
+# via scripts/extract-config.mjs --write. The leading "-" makes the unit
+# tolerant of the file being absent (defaults from cli.ts apply).
+EnvironmentFile=-%h/.config/openclaw-skillbank.env
 ExecStart=/usr/bin/env node %h/code/openclaw-skillbank/dist/cli.js sync
-Environment=SKILLBANK_API_URL=http://127.0.0.1:18789
-# Override these via ~/.config/environment.d/openclaw-skillbank.conf if needed.

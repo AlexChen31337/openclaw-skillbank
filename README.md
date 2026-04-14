@@ -84,6 +84,12 @@ openclaw-skillbank stats
 ## Run on a timer
 
 ```bash
+# 1. Generate the env file by extracting a non-conflicting provider from openclaw.json.
+#    Defaults pick anthropic-proxy-6 (z.ai) so distillation never shares a
+#    rate-limit bucket with your live agent.
+node scripts/extract-config.mjs --write   # writes ~/.config/openclaw-skillbank.env
+
+# 2. Install + enable the timer.
 install -d ~/.config/systemd/user
 install -m 0644 systemd/openclaw-skillbank.service ~/.config/systemd/user/
 install -m 0644 systemd/openclaw-skillbank.timer   ~/.config/systemd/user/
@@ -91,7 +97,20 @@ systemctl --user daemon-reload
 systemctl --user enable --now openclaw-skillbank.timer
 ```
 
-The default cadence is hourly with a 5-minute post-boot delay.
+Default cadence is **6 h** with a 15 min boot delay and 15 min jitter. This is
+deliberate: distillation isn't time-sensitive, and pacing it widely apart
+gives the rate-limit backoff and busy-guard plenty of room to do their job
+without paying for unnecessary work.
+
+### Why a separate provider matters
+
+If you point distillation at the same provider your live agent uses (e.g.
+`claude-code-plugin` backed by your Claude Pro subscription), a 17-batch
+distill run can saturate the shared rate-limit bucket and break user-facing
+turns for many minutes. The shipped defaults route through z.ai, which has
+its own bucket. If you must use the same provider, the busy-guard will skip
+runs while the plugin is mid-turn and the rate-limit retry will back off
+exponentially — but separation is still safer.
 
 ## Configuration
 
@@ -105,9 +124,20 @@ populating `~/.evoclaw-hub/data/rsi/skillbank.jsonl`.
 | `SKILLBANK_TRAJECTORIES` | `~/.evoclaw-hub/data/rsi/skillbank.jsonl` | Trajectory feed (envelope rows with `source:"trajectory"` + `_raw`). |
 | `SKILLBANK_CURSOR` | `~/.local/state/openclaw-skillbank/cursor.json` | Byte-offset cursor into the trajectory feed. |
 | `OPENCLAW_SKILLS_DIR` | `~/.openclaw/skills` | Where `distilled-*` SKILL.md directories are written. |
-| `SKILLBANK_API_URL` | `http://127.0.0.1:18789` | OpenAI-compat base URL (openclaw gateway). |
-| `SKILLBANK_API_KEY` | *(empty)* | Bearer token for the API. |
+| `SKILLBANK_API_URL` | `http://127.0.0.1:18789` | Distiller API base URL. The `extract-config` script overrides this to a non-conflicting upstream (e.g. `https://api.z.ai/api/anthropic`). |
+| `SKILLBANK_API_KEY` | *(empty)* | Bearer / `x-api-key` for the upstream. |
+| `SKILLBANK_API_FORMAT` | `openai` | `openai` (chat/completions) or `anthropic` (/v1/messages). |
 | `SKILLBANK_MODEL` | `anthropic-proxy-6/glm-4.7` | Distiller model id. |
+| `SKILLBANK_BATCH_SIZE` | `10` | Trajectories per LLM call. |
+| `SKILLBANK_MAX_PROMPT_CHARS` | `24000` | Sub-batch chunking budget. |
+| `SKILLBANK_MAX_OBSERVATION_CHARS` | `400` | Per-step observation truncation. |
+| `SKILLBANK_MAX_ACTION_CHARS` | `400` | Per-step action truncation. |
+| `SKILLBANK_MAX_RUN_MS` | `1800000` (30 min) | Wall-clock cap; remaining batches skipped past this. |
+| `SKILLBANK_INTER_BATCH_DELAY_MS` | `1000` | Pause between successful batches; gives a shared rate-limit bucket time to recover. |
+| `SKILLBANK_MAX_RATE_LIMIT_RETRIES` | `3` | Per-batch retries on 429 / "rate limit" errors. |
+| `SKILLBANK_RATE_LIMIT_BASE_DELAY_MS` | `5000` | Exponential backoff base. |
+| `SKILLBANK_BUSY_GUARD_URL` | `http://127.0.0.1:8091/health` | Probed before each run; if the response's `inflight` is at/above the threshold, the run is skipped. Set empty to disable. |
+| `SKILLBANK_BUSY_GUARD_INFLIGHT_THRESHOLD` | `1` | Inflight count at which the guard refuses to start. |
 | `SKILLBANK_PRUNE_MIN_SUCCESS_RATE` | `0.3` | `prune` threshold. |
 | `SKILLBANK_PRUNE_MIN_USAGE` | `5` | Minimum usage before a skill is eligible for pruning. |
 | `SKILLBANK_TOP_K` | `5` | Results returned by `retrieve`. |
