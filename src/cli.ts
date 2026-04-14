@@ -2,7 +2,7 @@
 import path from "node:path";
 import os from "node:os";
 import { FileStore } from "./store.js";
-import { LLMDistiller } from "./distiller.js";
+import { LLMDistiller, type DistillerApi } from "./distiller.js";
 import { SkillUpdater } from "./updater.js";
 import { TemplateRetriever } from "./retriever.js";
 import { formatForPrompt } from "./injector.js";
@@ -20,6 +20,7 @@ interface Env {
   openclawSkillsDir: string;
   apiUrl: string;
   apiKey: string;
+  apiFormat: DistillerApi;
   model: string;
   batchSize: number;
   maxPromptChars: number;
@@ -40,6 +41,7 @@ function env(): Env {
     openclawSkillsDir: process.env.OPENCLAW_SKILLS_DIR || path.join(HOME, ".openclaw/skills"),
     apiUrl: process.env.SKILLBANK_API_URL || "http://127.0.0.1:18789",
     apiKey: process.env.SKILLBANK_API_KEY || "",
+    apiFormat: (process.env.SKILLBANK_API_FORMAT === "anthropic" ? "anthropic" : "openai") as DistillerApi,
     model: process.env.SKILLBANK_MODEL || "anthropic-proxy-6/glm-4.7",
     batchSize: Number(process.env.SKILLBANK_BATCH_SIZE ?? 10),
     maxPromptChars: Number(process.env.SKILLBANK_MAX_PROMPT_CHARS ?? 24000),
@@ -104,7 +106,7 @@ async function distill(e: Env, opts: { dryRun: boolean }): Promise<void> {
 
   const store = new FileStore(e.storePath);
   const distiller = new LLMDistiller({
-    apiUrl: e.apiUrl, apiKey: e.apiKey, model: e.model,
+    apiUrl: e.apiUrl, apiKey: e.apiKey, api: e.apiFormat, model: e.model,
     batchSize: e.batchSize,
     maxPromptChars: e.maxPromptChars,
     maxObservationChars: e.maxObservationChars,
@@ -142,7 +144,7 @@ function retrieve(e: Env, task: string): void {
 function prune(e: Env): void {
   const store = new FileStore(e.storePath);
   const distiller = new LLMDistiller({
-    apiUrl: e.apiUrl, apiKey: e.apiKey, model: e.model,
+    apiUrl: e.apiUrl, apiKey: e.apiKey, api: e.apiFormat, model: e.model,
     batchSize: e.batchSize,
     maxPromptChars: e.maxPromptChars,
     maxObservationChars: e.maxObservationChars,

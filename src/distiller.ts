@@ -5,13 +5,22 @@ export interface Distiller {
   distill(trajectories: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }>;
 }
 
+export type DistillerApi = "openai" | "anthropic";
+
 export interface LLMDistillerOptions {
-  apiUrl: string; // OpenAI-compatible base URL (without /v1/...)
+  apiUrl: string; // base URL (without /v1/...)
   apiKey?: string;
+  // Which wire format the endpoint speaks. "openai" → /v1/chat/completions,
+  // "anthropic" → /v1/messages (also works for the openclaw claude-code-plugin).
+  api?: DistillerApi;
   model?: string;
   batchSize?: number;
   temperature?: number;
   timeoutMs?: number;
+  // Max tokens the distiller will request per call. Only used when the
+  // endpoint requires it (Anthropic). Defaults to 2048 which comfortably fits
+  // a "skills + mistakes" JSON response.
+  maxOutputTokens?: number;
   // Approximate maximum prompt characters per chat-completions call. We bucket
   // trajectories into sub-batches that stay under this budget before sending.
   // Default targets ~8K tokens of user content, which fits inside small local
@@ -30,6 +39,7 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_PROMPT_CHARS = 24_000;
 const DEFAULT_MAX_OBSERVATION_CHARS = 400;
 const DEFAULT_MAX_ACTION_CHARS = 400;
+const DEFAULT_MAX_OUTPUT_TOKENS = 2048;
 
 const SYSTEM_PROMPT = `You are an expert agent trainer. Given a batch of task trajectories, extract reusable skills and common mistakes that future agents should know.
 
@@ -61,6 +71,7 @@ Focus on patterns that appear across multiple trajectories. Omit one-off flukes.
 export class LLMDistiller implements Distiller {
   private readonly apiUrl: string;
   private readonly apiKey: string | undefined;
+  private readonly api: DistillerApi;
   private readonly model: string;
   private readonly batchSize: number;
   private readonly temperature: number;
@@ -68,10 +79,12 @@ export class LLMDistiller implements Distiller {
   private readonly maxPromptChars: number;
   private readonly maxObservationChars: number;
   private readonly maxActionChars: number;
+  private readonly maxOutputTokens: number;
 
   constructor(opts: LLMDistillerOptions) {
     this.apiUrl = opts.apiUrl.replace(/\/$/, "");
     this.apiKey = opts.apiKey;
+    this.api = opts.api ?? "openai";
     this.model = opts.model || DEFAULT_MODEL;
     this.batchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
     this.temperature = opts.temperature ?? 0.3;
@@ -79,6 +92,7 @@ export class LLMDistiller implements Distiller {
     this.maxPromptChars = opts.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS;
     this.maxObservationChars = opts.maxObservationChars ?? DEFAULT_MAX_OBSERVATION_CHARS;
     this.maxActionChars = opts.maxActionChars ?? DEFAULT_MAX_ACTION_CHARS;
+    this.maxOutputTokens = opts.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
   }
 
   async distill(trajectories: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
@@ -116,6 +130,14 @@ export class LLMDistiller implements Distiller {
 
   private async distillBatch(batch: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
     const userContent = buildPrompt(batch, { maxActionChars: this.maxActionChars, maxObservationChars: this.maxObservationChars });
+    const content = this.api === "anthropic"
+      ? await this.callAnthropic(userContent)
+      : await this.callOpenAI(userContent);
+    if (!content) throw new Error("distiller: empty completion content");
+    return parseResponse(content);
+  }
+
+  private async callOpenAI(userContent: string): Promise<string> {
     const body = {
       model: this.model,
       messages: [
@@ -124,26 +146,56 @@ export class LLMDistiller implements Distiller {
       ],
       temperature: this.temperature,
     };
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+    const json = await this.postJson(`${this.apiUrl}/v1/chat/completions`, headers, body) as {
+      choices?: { message?: { content?: string } }[];
+    };
+    return json.choices?.[0]?.message?.content ?? "";
+  }
+
+  private async callAnthropic(userContent: string): Promise<string> {
+    // Anthropic messages API: system is a top-level field, messages carry only
+    // user/assistant. max_tokens is required.
+    const body = {
+      model: this.model,
+      max_tokens: this.maxOutputTokens,
+      temperature: this.temperature,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: userContent }],
+    };
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+    };
+    // Anthropic uses x-api-key. Claude-code-plugin accepts either x-api-key or
+    // authorization, but x-api-key is the canonical header.
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+    const json = await this.postJson(`${this.apiUrl}/v1/messages`, headers, body) as {
+      content?: { type: string; text?: string }[];
+    };
+    const text = (json.content ?? [])
+      .filter((b) => b.type === "text" && typeof b.text === "string")
+      .map((b) => b.text as string)
+      .join("\n");
+    return text;
+  }
+
+  private async postJson(url: string, headers: Record<string, string>, body: unknown): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-    let content: string;
     try {
-      const headers: Record<string, string> = { "content-type": "application/json" };
-      if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
-      const res = await fetch(`${this.apiUrl}/v1/chat/completions`, {
+      const res = await fetch(url, {
         method: "POST", headers, body: JSON.stringify(body), signal: controller.signal,
       });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(`distiller api error ${res.status}: ${text.slice(0, 500)}`);
       }
-      const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-      content = json.choices?.[0]?.message?.content ?? "";
+      return await res.json();
     } finally {
       clearTimeout(timer);
     }
-    if (!content) throw new Error("distiller: empty completion content");
-    return parseResponse(content);
   }
 }
 
@@ -208,6 +260,30 @@ interface RawMistake {
   description?: string; why_it_happens?: string; how_to_avoid?: string; task_type?: string;
 }
 
+// Walk a string starting at the first `{`, tracking brace depth while
+// respecting string literals and escapes, and return the slice that covers a
+// single top-level JSON object. If no complete object is found, return the
+// original input so the subsequent JSON.parse surfaces a useful error.
+function extractBalancedJsonObject(s: string): string {
+  if (!s.startsWith("{")) return s;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escape) { escape = false; continue; }
+    if (inString) {
+      if (c === "\\") { escape = true; continue; }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) return s.slice(0, i + 1); }
+  }
+  return s;
+}
+
 function parseResponse(raw: string): { skills: Skill[]; mistakes: CommonMistake[] } {
   let content = raw.trim();
   // Strip ```json ... ``` fences (or bare ``` ... ```).
@@ -226,6 +302,9 @@ function parseResponse(raw: string): { skills: Skill[]; mistakes: CommonMistake[
   }
   const first = content.indexOf("{");
   if (first > 0) content = content.slice(first);
+  // Models often append explanatory prose after the JSON object; bound by the
+  // matching closing brace so JSON.parse doesn't choke on trailing text.
+  content = extractBalancedJsonObject(content);
 
   const parsed = JSON.parse(content) as { skills?: RawSkill[]; mistakes?: RawMistake[] };
   const now = new Date().toISOString();

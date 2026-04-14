@@ -51,7 +51,10 @@ export function exportSkillsToOpenclaw(opts: {
   const keep = new Set<string>();
   let written = 0;
   for (const s of opts.skills) {
-    const dirName = `${prefix}${sanitizeIdForPath(s.id)}`;
+    // Avoid double-prefix when the skill id already carries the marker
+    // (e.g. distilled-<ts>-<i> emitted by the LLM distiller).
+    const sanitized = sanitizeIdForPath(s.id);
+    const dirName = sanitized.startsWith(prefix) ? sanitized : `${prefix}${sanitized}`;
     const dirPath = path.join(outRoot, dirName);
     mkdirSync(dirPath, { recursive: true });
     const skillPath = path.join(dirPath, "SKILL.md");
