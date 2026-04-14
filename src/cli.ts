@@ -6,7 +6,7 @@ import { LLMDistiller, type DistillerApi } from "./distiller.js";
 import { SkillUpdater } from "./updater.js";
 import { TemplateRetriever } from "./retriever.js";
 import { formatForPrompt } from "./injector.js";
-import { exportSkillsToOpenclaw } from "./openclaw.js";
+import { exportSkillsToOpenclaw, exportMistakesToOpenclaw } from "./openclaw.js";
 import { loadNewTrajectories, saveCursor } from "./trajectories.js";
 import type { Trajectory } from "./types.js";
 
@@ -128,8 +128,11 @@ async function distill(e: Env, opts: { dryRun: boolean }): Promise<void> {
 function exportStore(e: Env): void {
   const store = new FileStore(e.storePath);
   const skills = store.list();
+  const mistakes = store.listMistakes();
   const { written, removed } = exportSkillsToOpenclaw({ skills, openclawSkillsDir: e.openclawSkillsDir });
-  console.error(`[export] wrote ${written}, removed ${removed} stale; total skills in store: ${skills.length}`);
+  const m = exportMistakesToOpenclaw({ mistakes, openclawSkillsDir: e.openclawSkillsDir });
+  const mistakeNote = m.written ? "updated" : m.removed ? "removed" : "unchanged";
+  console.error(`[export] skills: wrote ${written}, removed ${removed} stale (store has ${skills.length}); mistakes aggregate: ${mistakeNote} (${mistakes.length} mistakes)`);
 }
 
 function retrieve(e: Env, task: string): void {
