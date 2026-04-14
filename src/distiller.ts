@@ -21,6 +21,17 @@ export interface LLMDistillerOptions {
   // endpoint requires it (Anthropic). Defaults to 2048 which comfortably fits
   // a "skills + mistakes" JSON response.
   maxOutputTokens?: number;
+  // Max wall-clock time across all batches for a single distill() run.
+  // When exceeded, remaining batches are skipped. 0 disables. Default 0.
+  maxRunMs?: number;
+  // Max retries on rate-limit / 429 responses per batch. Default 3.
+  maxRateLimitRetries?: number;
+  // Base delay (ms) for the exponential backoff when retrying a rate-limited
+  // batch. Wait = baseDelay * 2^attempt with a small jitter. Default 5000.
+  rateLimitBaseDelayMs?: number;
+  // Fixed pause between successful batches to avoid saturating a shared
+  // rate-limit bucket (e.g. the user's Claude Pro subscription). Default 1000.
+  interBatchDelayMs?: number;
   // Approximate maximum prompt characters per chat-completions call. We bucket
   // trajectories into sub-batches that stay under this budget before sending.
   // Default targets ~8K tokens of user content, which fits inside small local
@@ -80,6 +91,10 @@ export class LLMDistiller implements Distiller {
   private readonly maxObservationChars: number;
   private readonly maxActionChars: number;
   private readonly maxOutputTokens: number;
+  private readonly maxRunMs: number;
+  private readonly maxRateLimitRetries: number;
+  private readonly rateLimitBaseDelayMs: number;
+  private readonly interBatchDelayMs: number;
 
   constructor(opts: LLMDistillerOptions) {
     this.apiUrl = opts.apiUrl.replace(/\/$/, "");
@@ -93,6 +108,10 @@ export class LLMDistiller implements Distiller {
     this.maxObservationChars = opts.maxObservationChars ?? DEFAULT_MAX_OBSERVATION_CHARS;
     this.maxActionChars = opts.maxActionChars ?? DEFAULT_MAX_ACTION_CHARS;
     this.maxOutputTokens = opts.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+    this.maxRunMs = opts.maxRunMs ?? 0;
+    this.maxRateLimitRetries = opts.maxRateLimitRetries ?? 3;
+    this.rateLimitBaseDelayMs = opts.rateLimitBaseDelayMs ?? 5000;
+    this.interBatchDelayMs = opts.interBatchDelayMs ?? 1000;
   }
 
   async distill(trajectories: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
@@ -106,14 +125,24 @@ export class LLMDistiller implements Distiller {
       maxActionChars: this.maxActionChars,
     });
 
+    const started = Date.now();
     let batchIdx = 0;
     let failedBatches = 0;
+    let skippedBatches = 0;
     for (const batch of groups) {
       batchIdx++;
+      if (this.maxRunMs > 0 && Date.now() - started > this.maxRunMs) {
+        skippedBatches = groups.length - batchIdx + 1;
+        process.stderr.write(`[distiller] maxRunMs (${this.maxRunMs}ms) exceeded; skipping remaining ${skippedBatches} batches\n`);
+        break;
+      }
       try {
-        const batchResult = await this.distillBatch(batch);
+        const batchResult = await this.distillBatchWithRetry(batch, batchIdx, groups.length);
         skills.push(...batchResult.skills);
         mistakes.push(...batchResult.mistakes);
+        if (this.interBatchDelayMs > 0 && batchIdx < groups.length) {
+          await sleep(this.interBatchDelayMs);
+        }
       } catch (err) {
         failedBatches++;
         const msg = err instanceof Error ? err.message : String(err);
@@ -122,10 +151,32 @@ export class LLMDistiller implements Distiller {
         process.stderr.write(`[distiller] batch ${batchIdx}/${groups.length} failed: ${msg.slice(0, 200)}\n`);
       }
     }
-    if (failedBatches > 0) {
-      process.stderr.write(`[distiller] ${failedBatches}/${groups.length} batches failed; produced ${skills.length} skills / ${mistakes.length} mistakes\n`);
+    if (failedBatches > 0 || skippedBatches > 0) {
+      process.stderr.write(`[distiller] ${failedBatches} failed + ${skippedBatches} skipped of ${groups.length}; produced ${skills.length} skills / ${mistakes.length} mistakes\n`);
     }
     return { skills, mistakes };
+  }
+
+  // Wrap one batch with exponential backoff when the upstream says
+  // "rate_limit" / returns 429. We detect both the HTTP status and common
+  // text markers used by providers that wrap rate-limit errors into 500s
+  // (the claude-code-plugin in particular bundles upstream throttling into
+  // a 500 with a message containing "rate limit" or "rate_limit").
+  private async distillBatchWithRetry(batch: Trajectory[], idx: number, total: number): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        return await this.distillBatch(batch);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!isRateLimitError(msg) || attempt >= this.maxRateLimitRetries) throw err;
+        const wait = this.rateLimitBaseDelayMs * 2 ** attempt + Math.floor(Math.random() * 500);
+        attempt++;
+        process.stderr.write(`[distiller] batch ${idx}/${total} rate-limited (attempt ${attempt}/${this.maxRateLimitRetries}); sleeping ${wait}ms\n`);
+        await sleep(wait);
+      }
+    }
   }
 
   private async distillBatch(batch: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
@@ -335,4 +386,20 @@ function parseResponse(raw: string): { skills: Skill[]; mistakes: CommonMistake[
   }));
 
   return { skills, mistakes };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Detect rate-limit errors from both OpenAI-compat (HTTP 429) and
+// anthropic-messages responses as well as the openclaw claude-code-plugin
+// which wraps upstream throttling in a 500 with "rate limit" in the body.
+function isRateLimitError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  if (lower.includes("429")) return true;
+  if (lower.includes("rate limit")) return true;
+  if (lower.includes("rate_limit")) return true;
+  if (lower.includes("too many requests")) return true;
+  return false;
 }

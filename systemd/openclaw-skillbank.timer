@@ -2,8 +2,14 @@
 Description=Periodic openclaw-skillbank distillation + export
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
+# 6h cadence by default. Distillation isn't time-sensitive and if it shares a
+# rate-limit bucket with the live agent (e.g. claude-code-plugin through a
+# Claude Pro subscription) an hourly cadence starves the agent. The service
+# also checks SKILLBANK_BUSY_GUARD_URL at start and skips if the gateway is
+# actively serving.
+OnBootSec=15min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
 Persistent=true
 
 [Install]

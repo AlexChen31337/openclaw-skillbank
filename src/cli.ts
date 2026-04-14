@@ -29,6 +29,12 @@ interface Env {
   minSuccessRate: number;
   minUsage: number;
   topK: number;
+  maxRunMs: number;
+  maxRateLimitRetries: number;
+  rateLimitBaseDelayMs: number;
+  interBatchDelayMs: number;
+  busyGuardUrl: string; // empty = disabled
+  busyGuardInflightThreshold: number;
 }
 
 function env(): Env {
@@ -50,6 +56,12 @@ function env(): Env {
     minSuccessRate: Number(process.env.SKILLBANK_PRUNE_MIN_SUCCESS_RATE ?? 0.3),
     minUsage: Number(process.env.SKILLBANK_PRUNE_MIN_USAGE ?? 5),
     topK: Number(process.env.SKILLBANK_TOP_K ?? 5),
+    maxRunMs: Number(process.env.SKILLBANK_MAX_RUN_MS ?? 30 * 60 * 1000), // 30 min default
+    maxRateLimitRetries: Number(process.env.SKILLBANK_MAX_RATE_LIMIT_RETRIES ?? 3),
+    rateLimitBaseDelayMs: Number(process.env.SKILLBANK_RATE_LIMIT_BASE_DELAY_MS ?? 5000),
+    interBatchDelayMs: Number(process.env.SKILLBANK_INTER_BATCH_DELAY_MS ?? 1000),
+    busyGuardUrl: process.env.SKILLBANK_BUSY_GUARD_URL ?? "http://127.0.0.1:8091/health",
+    busyGuardInflightThreshold: Number(process.env.SKILLBANK_BUSY_GUARD_INFLIGHT_THRESHOLD ?? 1),
   };
 }
 
@@ -94,7 +106,33 @@ async function main() {
   }
 }
 
+// Peek the configured busy-guard URL (openclaw claude-code-plugin /health by
+// default). When inflight >= threshold the plugin is actively serving the
+// user's agent — skipping distillation prevents contention on a shared
+// rate-limit bucket (e.g. Claude Pro subscription). Returns true if the
+// distiller should proceed.
+async function gatewayIsIdle(e: Env): Promise<boolean> {
+  if (!e.busyGuardUrl) return true;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2000);
+    const res = await fetch(e.busyGuardUrl, { signal: ctl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return true; // probe failed → don't block the run
+    const json = (await res.json()) as { inflight?: number };
+    const inflight = typeof json.inflight === "number" ? json.inflight : 0;
+    if (inflight >= e.busyGuardInflightThreshold) {
+      console.error(`[distill] gateway busy (inflight=${inflight} ≥ ${e.busyGuardInflightThreshold}); skipping run`);
+      return false;
+    }
+    return true;
+  } catch {
+    return true; // probe error → don't block the run
+  }
+}
+
 async function distill(e: Env, opts: { dryRun: boolean }): Promise<void> {
+  if (!(await gatewayIsIdle(e))) return;
   const { trajectories, nextOffset } = loadNewTrajectories(e.trajectoriesPath, e.cursorPath);
   console.error(`[distill] loaded ${trajectories.length} new trajectories from ${e.trajectoriesPath}`);
   if (trajectories.length === 0) return;
@@ -111,6 +149,10 @@ async function distill(e: Env, opts: { dryRun: boolean }): Promise<void> {
     maxPromptChars: e.maxPromptChars,
     maxObservationChars: e.maxObservationChars,
     maxActionChars: e.maxActionChars,
+    maxRunMs: e.maxRunMs,
+    maxRateLimitRetries: e.maxRateLimitRetries,
+    rateLimitBaseDelayMs: e.rateLimitBaseDelayMs,
+    interBatchDelayMs: e.interBatchDelayMs,
   });
   const updater = new SkillUpdater(distiller, store, e.archiveDir);
 
@@ -152,6 +194,10 @@ function prune(e: Env): void {
     maxPromptChars: e.maxPromptChars,
     maxObservationChars: e.maxObservationChars,
     maxActionChars: e.maxActionChars,
+    maxRunMs: e.maxRunMs,
+    maxRateLimitRetries: e.maxRateLimitRetries,
+    rateLimitBaseDelayMs: e.rateLimitBaseDelayMs,
+    interBatchDelayMs: e.interBatchDelayMs,
   });
   const updater = new SkillUpdater(distiller, store, e.archiveDir);
   const pruned = updater.pruneStaleSkills(e.minSuccessRate, e.minUsage);
