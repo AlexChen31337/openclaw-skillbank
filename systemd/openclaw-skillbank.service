@@ -1,0 +1,9 @@
+[Unit]
+Description=openclaw-skillbank: distill trajectories and export SKILL.md
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env node %h/code/openclaw-skillbank/dist/cli.js sync
+Environment=SKILLBANK_API_URL=http://127.0.0.1:18789
+# Override these via ~/.config/environment.d/openclaw-skillbank.conf if needed.

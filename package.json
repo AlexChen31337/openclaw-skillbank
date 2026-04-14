@@ -1,0 +1,29 @@
+{
+  "name": "openclaw-skillbank",
+  "version": "0.1.0",
+  "description": "Autonomous skill distillation for OpenClaw. Reads agent trajectories, extracts reusable skills and common mistakes via an LLM, writes them as openclaw SKILL.md files.",
+  "type": "module",
+  "bin": {
+    "openclaw-skillbank": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run build",
+    "start": "node dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "systemd",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": ["openclaw", "agent", "skills", "distillation", "rsi", "llm"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
