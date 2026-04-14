@@ -21,6 +21,10 @@ interface Env {
   apiUrl: string;
   apiKey: string;
   model: string;
+  batchSize: number;
+  maxPromptChars: number;
+  maxObservationChars: number;
+  maxActionChars: number;
   minSuccessRate: number;
   minUsage: number;
   topK: number;
@@ -37,6 +41,10 @@ function env(): Env {
     apiUrl: process.env.SKILLBANK_API_URL || "http://127.0.0.1:18789",
     apiKey: process.env.SKILLBANK_API_KEY || "",
     model: process.env.SKILLBANK_MODEL || "anthropic-proxy-6/glm-4.7",
+    batchSize: Number(process.env.SKILLBANK_BATCH_SIZE ?? 10),
+    maxPromptChars: Number(process.env.SKILLBANK_MAX_PROMPT_CHARS ?? 24000),
+    maxObservationChars: Number(process.env.SKILLBANK_MAX_OBSERVATION_CHARS ?? 400),
+    maxActionChars: Number(process.env.SKILLBANK_MAX_ACTION_CHARS ?? 400),
     minSuccessRate: Number(process.env.SKILLBANK_PRUNE_MIN_SUCCESS_RATE ?? 0.3),
     minUsage: Number(process.env.SKILLBANK_PRUNE_MIN_USAGE ?? 5),
     topK: Number(process.env.SKILLBANK_TOP_K ?? 5),
@@ -95,7 +103,13 @@ async function distill(e: Env, opts: { dryRun: boolean }): Promise<void> {
   console.error(`[distill] ${failures.length}/${trajectories.length} are failures; distilling those`);
 
   const store = new FileStore(e.storePath);
-  const distiller = new LLMDistiller({ apiUrl: e.apiUrl, apiKey: e.apiKey, model: e.model });
+  const distiller = new LLMDistiller({
+    apiUrl: e.apiUrl, apiKey: e.apiKey, model: e.model,
+    batchSize: e.batchSize,
+    maxPromptChars: e.maxPromptChars,
+    maxObservationChars: e.maxObservationChars,
+    maxActionChars: e.maxActionChars,
+  });
   const updater = new SkillUpdater(distiller, store, e.archiveDir);
 
   if (opts.dryRun) {
@@ -127,7 +141,13 @@ function retrieve(e: Env, task: string): void {
 
 function prune(e: Env): void {
   const store = new FileStore(e.storePath);
-  const distiller = new LLMDistiller({ apiUrl: e.apiUrl, apiKey: e.apiKey, model: e.model });
+  const distiller = new LLMDistiller({
+    apiUrl: e.apiUrl, apiKey: e.apiKey, model: e.model,
+    batchSize: e.batchSize,
+    maxPromptChars: e.maxPromptChars,
+    maxObservationChars: e.maxObservationChars,
+    maxActionChars: e.maxActionChars,
+  });
   const updater = new SkillUpdater(distiller, store, e.archiveDir);
   const pruned = updater.pruneStaleSkills(e.minSuccessRate, e.minUsage);
   console.error(`[prune] archived ${pruned} stale skills`);

@@ -12,11 +12,24 @@ export interface LLMDistillerOptions {
   batchSize?: number;
   temperature?: number;
   timeoutMs?: number;
+  // Approximate maximum prompt characters per chat-completions call. We bucket
+  // trajectories into sub-batches that stay under this budget before sending.
+  // Default targets ~8K tokens of user content, which fits inside small local
+  // models (llama-server 4K needs maxPromptChars ≈ 12000 with some margin).
+  maxPromptChars?: number;
+  // Per-step observation truncation when building the prompt. Long tool
+  // outputs blow up token counts; keep enough to convey the error shape.
+  maxObservationChars?: number;
+  // Per-step action truncation (arguments JSON can be huge).
+  maxActionChars?: number;
 }
 
 const DEFAULT_MODEL = "anthropic-proxy-6/glm-4.7";
 const DEFAULT_BATCH_SIZE = 10;
 const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_PROMPT_CHARS = 24_000;
+const DEFAULT_MAX_OBSERVATION_CHARS = 400;
+const DEFAULT_MAX_ACTION_CHARS = 400;
 
 const SYSTEM_PROMPT = `You are an expert agent trainer. Given a batch of task trajectories, extract reusable skills and common mistakes that future agents should know.
 
@@ -52,6 +65,9 @@ export class LLMDistiller implements Distiller {
   private readonly batchSize: number;
   private readonly temperature: number;
   private readonly timeoutMs: number;
+  private readonly maxPromptChars: number;
+  private readonly maxObservationChars: number;
+  private readonly maxActionChars: number;
 
   constructor(opts: LLMDistillerOptions) {
     this.apiUrl = opts.apiUrl.replace(/\/$/, "");
@@ -60,27 +76,51 @@ export class LLMDistiller implements Distiller {
     this.batchSize = opts.batchSize ?? DEFAULT_BATCH_SIZE;
     this.temperature = opts.temperature ?? 0.3;
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.maxPromptChars = opts.maxPromptChars ?? DEFAULT_MAX_PROMPT_CHARS;
+    this.maxObservationChars = opts.maxObservationChars ?? DEFAULT_MAX_OBSERVATION_CHARS;
+    this.maxActionChars = opts.maxActionChars ?? DEFAULT_MAX_ACTION_CHARS;
   }
 
   async distill(trajectories: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
     const skills: Skill[] = [];
     const mistakes: CommonMistake[] = [];
 
-    for (let i = 0; i < trajectories.length; i += this.batchSize) {
-      const batch = trajectories.slice(i, i + this.batchSize);
-      const batchResult = await this.distillBatch(batch);
-      skills.push(...batchResult.skills);
-      mistakes.push(...batchResult.mistakes);
+    const groups = chunkWithinBudget(trajectories, {
+      batchSize: this.batchSize,
+      maxPromptChars: this.maxPromptChars,
+      maxObservationChars: this.maxObservationChars,
+      maxActionChars: this.maxActionChars,
+    });
+
+    let batchIdx = 0;
+    let failedBatches = 0;
+    for (const batch of groups) {
+      batchIdx++;
+      try {
+        const batchResult = await this.distillBatch(batch);
+        skills.push(...batchResult.skills);
+        mistakes.push(...batchResult.mistakes);
+      } catch (err) {
+        failedBatches++;
+        const msg = err instanceof Error ? err.message : String(err);
+        // Don't abort the whole run when a single batch fails (LLM bad JSON,
+        // timeout, etc.). Surface and continue.
+        process.stderr.write(`[distiller] batch ${batchIdx}/${groups.length} failed: ${msg.slice(0, 200)}\n`);
+      }
+    }
+    if (failedBatches > 0) {
+      process.stderr.write(`[distiller] ${failedBatches}/${groups.length} batches failed; produced ${skills.length} skills / ${mistakes.length} mistakes\n`);
     }
     return { skills, mistakes };
   }
 
   private async distillBatch(batch: Trajectory[]): Promise<{ skills: Skill[]; mistakes: CommonMistake[] }> {
+    const userContent = buildPrompt(batch, { maxActionChars: this.maxActionChars, maxObservationChars: this.maxObservationChars });
     const body = {
       model: this.model,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: buildPrompt(batch) },
+        { role: "user", content: userContent },
       ],
       temperature: this.temperature,
     };
@@ -107,21 +147,57 @@ export class LLMDistiller implements Distiller {
   }
 }
 
-function buildPrompt(trajectories: Trajectory[]): string {
+interface PromptBudget { maxActionChars: number; maxObservationChars: number }
+
+function truncate(s: string, n: number): string {
+  if (!s) return "";
+  if (s.length <= n) return s;
+  return s.slice(0, n) + `…[+${s.length - n} chars]`;
+}
+
+function buildPrompt(trajectories: Trajectory[], budget?: Partial<PromptBudget>): string {
+  const b: PromptBudget = {
+    maxActionChars: budget?.maxActionChars ?? Number.MAX_SAFE_INTEGER,
+    maxObservationChars: budget?.maxObservationChars ?? Number.MAX_SAFE_INTEGER,
+  };
   const parts: string[] = ["Here are the agent trajectories to analyze:\n"];
   trajectories.forEach((t, i) => {
     parts.push(`--- Trajectory ${i + 1} ---`);
-    parts.push(`Task: ${t.task_description}`);
+    parts.push(`Task: ${truncate(t.task_description, 400)}`);
     parts.push(`Type: ${t.task_type}`);
     parts.push(`Success: ${t.success} | Quality: ${t.quality.toFixed(2)}`);
     t.steps.forEach((s, j) => {
-      parts.push(`  Step ${j + 1}: ${s.action}`);
-      parts.push(`    → ${s.observation}`);
+      parts.push(`  Step ${j + 1}: ${truncate(s.action, b.maxActionChars)}`);
+      parts.push(`    → ${truncate(s.observation, b.maxObservationChars)}`);
     });
     parts.push("");
   });
   parts.push("\nExtract reusable skills and common mistakes from the above trajectories.");
   return parts.join("\n");
+}
+
+// Greedily fill sub-batches so each one stays under maxPromptChars (bounded
+// both by the user-set batchSize and by the rendered prompt length after
+// truncation). Trajectories that individually overflow the budget are sent
+// as a batch of one; the distillation is best-effort.
+function chunkWithinBudget(
+  trajectories: Trajectory[],
+  cfg: { batchSize: number; maxPromptChars: number } & PromptBudget,
+): Trajectory[][] {
+  const batches: Trajectory[][] = [];
+  let current: Trajectory[] = [];
+  for (const t of trajectories) {
+    const next = [...current, t];
+    const promptLen = buildPrompt(next, cfg).length;
+    if (current.length > 0 && (next.length > cfg.batchSize || promptLen > cfg.maxPromptChars)) {
+      batches.push(current);
+      current = [t];
+    } else {
+      current = next;
+    }
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
 }
 
 interface RawSkill {
