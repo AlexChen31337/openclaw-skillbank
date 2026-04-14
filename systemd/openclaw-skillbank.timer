@@ -2,14 +2,12 @@
 Description=Periodic openclaw-skillbank distillation + export
 
 [Timer]
-# 6h cadence by default. Distillation isn't time-sensitive and if it shares a
-# rate-limit bucket with the live agent (e.g. claude-code-plugin through a
-# Claude Pro subscription) an hourly cadence starves the agent. The service
-# also checks SKILLBANK_BUSY_GUARD_URL at start and skips if the gateway is
-# actively serving.
-OnBootSec=15min
-OnUnitActiveSec=6h
-RandomizedDelaySec=15min
+# Once nightly. Distillation isn't time-sensitive — running it during quiet
+# hours keeps it well clear of any user-facing agent traffic and trivially
+# avoids rate-limit contention even on shared buckets.
+# Override by dropping a unit file at ~/.config/systemd/user/openclaw-skillbank.timer.d/override.conf
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=30min
 Persistent=true
 
 [Install]

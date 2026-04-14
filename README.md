@@ -97,10 +97,21 @@ systemctl --user daemon-reload
 systemctl --user enable --now openclaw-skillbank.timer
 ```
 
-Default cadence is **6 h** with a 15 min boot delay and 15 min jitter. This is
-deliberate: distillation isn't time-sensitive, and pacing it widely apart
-gives the rate-limit backoff and busy-guard plenty of room to do their job
-without paying for unnecessary work.
+Default cadence is **once nightly at 03:00** with up to 30 min random jitter.
+Distillation isn't time-sensitive, and quiet-hours scheduling avoids any
+contention with daytime user-facing traffic without depending on the
+busy-guard. Override with a drop-in:
+
+```bash
+mkdir -p ~/.config/systemd/user/openclaw-skillbank.timer.d
+cat > ~/.config/systemd/user/openclaw-skillbank.timer.d/override.conf <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 02:00:00
+EOF
+systemctl --user daemon-reload
+systemctl --user restart openclaw-skillbank.timer
+```
 
 ### Why a separate provider matters
 
